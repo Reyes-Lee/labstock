@@ -3,6 +3,7 @@ config.ini
 # 實際實驗室資料與示範執行產生的檔案
 data/lab/
 data/demo/
+data/cli_demo/
 output/
 **/outbox/
 **/backup/

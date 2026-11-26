@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import functools
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
@@ -16,6 +18,20 @@ from .storage import Storage
 
 IN_STOCK = "在庫"
 EMPTY = "用完"
+CONTAINERS = ["瓶", "管", "盒", "包", "罐", "箱", "袋", "支"]
+EDITABLE = {"name": "名稱", "unit": "單位", "container": "包裝單位", "safety_stock": "安全庫存量",
+            "location": "存放位置", "category": "類別", "vendor": "廠商"}
+
+_LOCK = threading.RLock()
+
+
+def locked(fn):
+    """會寫入資料的操作一次只允許一個執行（網頁版多人同時操作時避免互相覆蓋）。"""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _LOCK:
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 class InventoryError(ValueError):
@@ -35,6 +51,18 @@ class UseResult:
     total_after: float
     safety_stock: float
     crossed_below_safety: bool  # 這次領用讓總量「剛好跌破」安全量 → 要寄提醒
+
+
+@dataclass
+class UndoResult:
+    log_id: str
+    reagent_id: str
+    name: str
+    unit: str
+    bottle_no: int
+    qty: float
+    bottle_remaining: float
+    total_after: float
 
 
 def parse_date(text: str) -> date:
@@ -72,8 +100,9 @@ class Inventory:
         return hit.iloc[0]
 
     # ---------- F1 試劑資料管理 ----------
+    @locked
     def add_reagent(self, name: str, unit: str, safety_stock: float, location: str = "",
-                    category: str = "", vendor: str = "", user: str = "") -> str:
+                    category: str = "", vendor: str = "", user: str = "", container: str = "瓶") -> str:
         name, unit = name.strip(), unit.strip()
         if not name:
             raise InventoryError("試劑名稱不可空白")
@@ -91,6 +120,7 @@ class Inventory:
             raise InventoryError(f"已經有名為「{name}」的試劑，請改用入庫功能")
         new_id = f"R{len(reagents) + 1:03d}"
         row = {"reagent_id": new_id, "name": name, "category": category.strip(), "unit": unit,
+               "container": container.strip() or "瓶",
                "location": location.strip(), "safety_stock": safety_stock,
                "vendor": vendor.strip(), "active": True,
                "created_at": self.today.isoformat()}
@@ -99,6 +129,46 @@ class Inventory:
         self.storage.save("usage_log", self._log(log, user, "新增品項", new_id, note=name))
         return new_id
 
+    @locked
+    def edit_reagent(self, reagent_id: str, user: str = "", **changes) -> dict:
+        """修改品項資料；回傳 {欄位: (舊值, 新值)}。空字串或 None 代表不修改。"""
+        old = self.get_reagent(reagent_id)
+        unknown = set(changes) - set(EDITABLE)
+        if unknown:
+            raise InventoryError(f"不能修改的欄位：{', '.join(unknown)}")
+        new = {k: (str(v).strip() if k != "safety_stock" else v) for k, v in changes.items()
+               if v is not None and str(v).strip() != ""}
+        if "safety_stock" in new:
+            try:
+                new["safety_stock"] = float(new["safety_stock"])
+            except (TypeError, ValueError):
+                raise InventoryError("安全庫存量必須是數字")
+            if new["safety_stock"] < 0:
+                raise InventoryError("安全庫存量不可小於 0")
+        diff = {k: (old[k], v) for k, v in new.items() if str(old[k]) != str(v) and old[k] != v}
+        if not diff:
+            raise InventoryError("沒有任何修改")
+        reagents, bottles, log = self._tables()
+        if "name" in diff:
+            others = reagents[reagents.active & (reagents.reagent_id != reagent_id)]
+            if (others["name"].str.lower() == diff["name"][1].lower()).any():
+                raise InventoryError(f"已經有名為「{diff['name'][1]}」的試劑")
+        if "unit" in diff:
+            has_stock = ((bottles.reagent_id == reagent_id) & (bottles.status == IN_STOCK)
+                         & (bottles.remaining_qty > 0)).any()
+            if has_stock:
+                raise InventoryError("此試劑還有庫存，不能修改單位（會讓既有數量的意義改變）；"
+                                     "請等用完後再改，或另建新品項")
+        idx = reagents.index[reagents.reagent_id == reagent_id][0]
+        for k, (_, v) in diff.items():
+            reagents.at[idx, k] = v
+        note = "；".join(f"{EDITABLE[k]} {a:g}→{b:g}" if k == "safety_stock" else f"{EDITABLE[k]} {a}→{b}"
+                        for k, (a, b) in diff.items())
+        self.storage.save("reagents", reagents)
+        self.storage.save("usage_log", self._log(log, user, "編輯品項", reagent_id, note=note))
+        return diff
+
+    @locked
     def deactivate_reagent(self, reagent_id: str, user: str = "") -> None:
         """刪除品項＝停用：從清單隱藏，但保留歷史紀錄（實作時修改的需求）。"""
         reagent = self.get_reagent(reagent_id)
@@ -108,9 +178,10 @@ class Inventory:
         self.storage.save("usage_log", self._log(log, user, "刪除品項", reagent_id, note=reagent["name"]))
 
     # ---------- F2 分裝入庫與瓶號 ----------
+    @locked
     def stock_in(self, reagent_id: str, n_bottles: int, qty_per_bottle: float,
                  expiry_date: str, user: str = "", received_date: str | None = None) -> list[str]:
-        self.get_reagent(reagent_id)
+        c = self.get_reagent(reagent_id)["container"]
         try:
             n_bottles = int(n_bottles)
             qty_per_bottle = float(qty_per_bottle)
@@ -142,7 +213,7 @@ class Inventory:
         bottles = pd.concat([bottles, pd.DataFrame(rows)], ignore_index=True)
         self.storage.save("bottles", bottles)
         log = self._log(log, user, "入庫", reagent_id, qty=n_bottles * qty_per_bottle,
-                        note=f"{n_bottles} 瓶 × {qty_per_bottle:g}，瓶號 #{start}～#{start + n_bottles - 1}")
+                        note=f"{n_bottles} {c} × {qty_per_bottle:g}，序號 #{start}～#{start + n_bottles - 1}")
         self.storage.save("usage_log", log)
         return ids
 
@@ -170,6 +241,7 @@ class Inventory:
         return float(b[ok].remaining_qty.sum()) if len(b) else 0.0
 
     # ---------- F3 領用扣量 ----------
+    @locked
     def use(self, reagent_id: str, qty: float, user: str = "", bottle_id: str | None = None) -> UseResult:
         reagent = self.get_reagent(reagent_id)
         try:
@@ -182,7 +254,7 @@ class Inventory:
         if bottle_id is None:
             pick = self.suggest_bottle(reagent_id)
             if pick is None:
-                raise InventoryError(f"「{reagent['name']}」沒有可用（未過期且有剩量）的瓶，請先入庫")
+                raise InventoryError(f"「{reagent['name']}」沒有可用（未過期且有剩量）的{reagent['container']}，請先入庫")
             bottle_id = pick.bottle_id
 
         reagents, bottles, log = self._tables()
@@ -194,9 +266,10 @@ class Inventory:
             raise InventoryError(f"{bottle_id} 已經用完")
         remaining = float(bottles.at[i, "remaining_qty"])
         if qty > remaining + 1e-9:
+            c = reagent["container"]
             raise InventoryError(
-                f"使用量 {qty:g} {reagent['unit']} 大於此瓶剩量 {remaining:g} {reagent['unit']}，"
-                "請先用完此瓶再開下一瓶，或分兩次登錄")
+                f"使用量 {qty:g} {reagent['unit']} 大於此{c}剩量 {remaining:g} {reagent['unit']}，"
+                f"請先用完此{c}再開下一{c}，或分兩次登錄")
 
         before = self.total_stock(reagent_id, bottles)
         new_remaining = round(remaining - qty, 6)
@@ -220,6 +293,47 @@ class Inventory:
             raise InventoryError(f"{bottle_id} 不在可用清單中")
         return self.use(reagent_id, float(hit.iloc[0].remaining_qty), user, bottle_id)
 
+    # ---------- 撤銷領用（實作時新增的需求：登錄錯誤要能補救） ----------
+    def recent_uses(self, limit: int = 10, user: str | None = None) -> pd.DataFrame:
+        """最近的領用紀錄（已撤銷的不列出），最新的在最上面。"""
+        reagents, bottles, log = self._tables()
+        undone = set(log[log.action == "撤銷領用"].note.str.extract(r"^撤銷 (L\d+)")[0].dropna())
+        u = log[(log.action == "領用") & ~log.log_id.isin(undone)]
+        if user:
+            u = u[u.user == user]
+        u = u.tail(limit).iloc[::-1].copy()
+        names = reagents.set_index("reagent_id")
+        u["name"] = u.reagent_id.map(names["name"])
+        u["unit"] = u.reagent_id.map(names["unit"])
+        u["bottle_no"] = u.bottle_id.map(bottles.set_index("bottle_id").bottle_no)
+        return u.reset_index(drop=True)
+
+    @locked
+    def undo_use(self, log_id: str, user: str = "") -> UndoResult:
+        reagents, bottles, log = self._tables()
+        hit = log[log.log_id == log_id.strip().upper()]
+        if hit.empty:
+            raise InventoryError(f"找不到紀錄 {log_id}")
+        rec = hit.iloc[0]
+        if rec.action != "領用":
+            raise InventoryError(f"{rec.log_id} 是「{rec.action}」紀錄，只能撤銷領用")
+        if (log[log.action == "撤銷領用"].note.str.startswith(f"撤銷 {rec.log_id}")).any():
+            raise InventoryError(f"{rec.log_id} 已經撤銷過了")
+        reagent = self.get_reagent(rec.reagent_id)
+        idx = bottles.index[bottles.bottle_id == rec.bottle_id]
+        if len(idx) == 0:
+            raise InventoryError(f"找不到瓶 {rec.bottle_id}")
+        i = idx[0]
+        bottles.at[i, "remaining_qty"] = round(float(bottles.at[i, "remaining_qty"]) + float(rec.qty), 6)
+        bottles.at[i, "status"] = IN_STOCK
+        self.storage.save("bottles", bottles)
+        note = f"撤銷 {rec.log_id}（{rec.time} {rec.user} 領用 {rec.qty:g}）"
+        self.storage.save("usage_log", self._log(log, user, "撤銷領用", rec.reagent_id, rec.bottle_id,
+                                                  float(rec.qty), note))
+        return UndoResult(rec.log_id, rec.reagent_id, reagent["name"], reagent["unit"],
+                          int(bottles.at[i, "bottle_no"]), float(rec.qty), float(bottles.at[i, "remaining_qty"]),
+                          self.total_stock(rec.reagent_id, bottles))
+
     # ---------- 彙總（供查詢、提醒、統計使用） ----------
     def summary(self) -> pd.DataFrame:
         reagents, bottles, _ = self._tables()
@@ -239,10 +353,10 @@ class Inventory:
             if any(parse_date(d) < self.today for d in b.expiry_date):
                 flag += "・有過期瓶"
             rows.append({"reagent_id": r.reagent_id, "name": r["name"], "category": r.category,
-                         "unit": r.unit, "location": r.location, "vendor": r.vendor,
+                         "unit": r.unit, "container": r.container, "location": r.location, "vendor": r.vendor,
                          "total": total, "safety_stock": float(r.safety_stock), "bottles": len(b),
                          "nearest_expiry": nearest, "last_received": last_in, "flag": flag})
-        cols = ["reagent_id", "name", "category", "unit", "location", "vendor", "total",
+        cols = ["reagent_id", "name", "category", "unit", "container", "location", "vendor", "total",
                 "safety_stock", "bottles", "nearest_expiry", "last_received", "flag"]
         return pd.DataFrame(rows, columns=cols)
 

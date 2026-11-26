@@ -17,7 +17,7 @@ import pandas as pd
 from .config import BACKUP_KEEP
 
 TABLES: dict[str, list[str]] = {
-    "reagents": ["reagent_id", "name", "category", "unit", "location",
+    "reagents": ["reagent_id", "name", "category", "unit", "container", "location",
                  "safety_stock", "vendor", "active", "created_at"],
     "bottles": ["bottle_id", "reagent_id", "bottle_no", "initial_qty", "remaining_qty",
                 "received_date", "expiry_date", "status"],
@@ -60,6 +60,8 @@ class Storage:
         for c in cols:
             if c not in NUMERIC[table] and c != "active":
                 df[c] = df[c].astype(str)
+        if table == "reagents":  # 舊資料沒有包裝單位欄位時預設為「瓶」
+            df.loc[df["container"].str.strip() == "", "container"] = "瓶"
         return df
 
     def save(self, table: str, df: pd.DataFrame) -> None:

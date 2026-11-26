@@ -36,16 +36,16 @@ def stats(inv: Inventory) -> dict:
     s = inv.summary()
     return {
         "品項數": len(s),
-        "在庫瓶數": int(s.bottles.sum()) if len(s) else 0,
+        "在庫包裝數": int(s.bottles.sum()) if len(s) else 0,
         "低庫存品項": int((s.flag == "低庫存").sum()),
         "缺貨品項": int((s.flag == "缺貨").sum()),
-        "30 天內到期（含已過期）瓶數": len(inv.expiring()),
+        "30 天內到期（含已過期）件數": len(inv.expiring()),
         "各類別品項數": s.groupby("category").size().to_dict() if len(s) else {},
     }
 
 
-def plot_stock(inv: Inventory, out_path: Path | str) -> Path:
-    """畫出各試劑「可用量 ÷ 安全庫存量」的長條圖。
+def stock_figure(inv: Inventory):
+    """畫出各試劑「可用量 ÷ 安全庫存量」的長條圖，回傳 matplotlib Figure（網頁版直接顯示）。
 
     各試劑單位不同（mL、g、支），直接比剩量沒有意義，所以改用百分比；
     低於 100%（低於安全庫存）的標成紅色。
@@ -76,6 +76,13 @@ def plot_stock(inv: Inventory, out_path: Path | str) -> Path:
     ax.set_title(f"LabStock 庫存狀態（{inv.today.isoformat()}）紅色＝低於安全庫存")
     ax.set_xlim(0, 480)
     fig.tight_layout()
+    return fig
+
+
+def plot_stock(inv: Inventory, out_path: Path | str) -> Path:
+    """把庫存圖表存成 PNG。"""
+    import matplotlib.pyplot as plt
+    fig = stock_figure(inv)
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=150)

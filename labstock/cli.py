@@ -14,7 +14,7 @@ from . import __version__
 from .config import BASE_DIR, DEFAULT_DATA_DIR, EXPIRY_WARNING_DAYS, SAMPLE_DATA_DIR, load_email_settings
 from .export import export_bottles, export_report
 from .inventory import Inventory, InventoryError, parse_date
-from .notifier import Notifier, expiry_message, low_stock_message
+from .notifier import Notifier, daily_reminder, low_stock_message, send_alerts
 from .search import SORT_KEYS, plot_stock, search, sort_summary, stats
 from .storage import Storage
 
@@ -61,6 +61,11 @@ def rel(p) -> str:
         return str(p)
 
 
+def k_label(key: str) -> str:
+    from .inventory import EDITABLE
+    return EDITABLE.get(key, key)
+
+
 def _fmt(v) -> str:
     if isinstance(v, float):
         return f"{v:g}"
@@ -68,7 +73,7 @@ def _fmt(v) -> str:
 
 
 SUMMARY_COLS = {"reagent_id": "編號", "name": "試劑名稱", "total": "可用量", "unit": "單位",
-                "safety_stock": "安全量", "bottles": "瓶數", "nearest_expiry": "最近效期",
+                "safety_stock": "安全量", "bottles": "包裝數", "nearest_expiry": "最近效期",
                 "location": "存放位置", "flag": "狀態"}
 
 
@@ -100,7 +105,7 @@ class App:
         b = b.assign(no=["#" + str(n) for n in b.bottle_no],
                      note=["已過期！" if d < 0 else ("即將到期" if d <= EXPIRY_WARNING_DAYS else "")
                            for d in b.days_left])
-        print(table(b, {"no": "瓶號", "remaining_qty": "剩量", "received_date": "入庫日",
+        print(table(b, {"no": "序號", "remaining_qty": "剩量", "received_date": "入庫日",
                         "expiry_date": "效期", "days_left": "剩餘天數", "note": "備註"}))
         return b
 
@@ -116,13 +121,13 @@ class App:
         if key in SORT_KEYS:
             print(f"\n  依「{SORT_KEYS[key][2]}」排序：")
             print(table(sort_summary(found, key), SUMMARY_COLS))
-        rid = ask("輸入編號查看每瓶明細與紀錄（Enter 返回）：").upper()
+        rid = ask("輸入編號查看每個包裝的明細與紀錄（Enter 返回）：").upper()
         if rid in set(found.reagent_id):
-            print("\n  【各瓶（依先進先出排序）】")
+            print("\n  【各包裝（依先進先出排序）】")
             self.show_bottles(rid)
             print("\n  【最近紀錄】")
             print(table(self.inv.history(rid, 5), {"time": "時間", "user": "操作者", "action": "動作",
-                                                    "bottle_id": "瓶", "qty": "數量", "note": "備註"}))
+                                                    "bottle_id": "包裝", "qty": "數量", "note": "備註"}))
 
     # 2 領用
     def use(self):
@@ -132,29 +137,30 @@ class App:
         rid = r.reagent_id
         b = self.show_bottles(rid)
         if b.empty:
-            print("  目前沒有在庫的瓶，請先入庫。")
+            print(f"  目前沒有在庫的{r.container}，請先入庫。")
             return
         pick = self.inv.suggest_bottle(rid)
         if pick is None:
-            print("  所有在庫的瓶都已過期，請確認是否還能使用並處理過期試劑。")
+            print(f"  所有在庫的{r.container}都已過期，請確認是否還能使用並處理過期試劑。")
             return
         print(f"\n  ▶ 建議使用 #{pick.bottle_no}（最早到期且未過期，效期 {pick.expiry_date}）")
-        choice = ask(f"使用量（{r.unit}；輸入 a＝此瓶整瓶用完；輸入 #瓶號 可改用其他瓶）：")
+        c = r.container
+        choice = ask(f"使用量（{r.unit}；輸入 a＝此{c}整{c}用完；輸入 #序號 可改用其他{c}）：")
         bottle_id = pick.bottle_id
         if choice.startswith("#"):
             no = choice[1:]
             hit = b[b.bottle_no.astype(str) == no]
             if hit.empty:
-                print("  沒有這個瓶號。")
+                print("  沒有這個序號。")
                 return
             bottle_id = hit.iloc[0].bottle_id
-            choice = ask(f"使用量（{r.unit}；a＝整瓶用完）：")
+            choice = ask(f"使用量（{r.unit}；a＝整{c}用完）：")
         if choice.lower() == "a":
             res = self.inv.use_up(rid, bottle_id, self.user)
         else:
             res = self.inv.use(rid, choice, self.user, bottle_id)
         print(f"\n  ✔ 已登錄：{res.name} #{res.bottle_no} 使用 {res.used:g} {res.unit}，"
-              f"此瓶剩 {res.bottle_remaining:g} {res.unit}")
+              f"此{c}剩 {res.bottle_remaining:g} {res.unit}")
         print(f"  ✔ 可用總量：{res.total_before:g} → {res.total_after:g} {res.unit}"
               f"（安全量 {res.safety_stock:g}）")
         if res.crossed_below_safety:
@@ -168,31 +174,33 @@ class App:
         r = self.pick_reagent()
         if r is None:
             return
-        n = ask("這次分裝幾瓶：")
-        q = ask(f"每瓶容量（{r.unit}）：")
+        c = r.container
+        n = ask(f"這次分裝幾{c}：")
+        q = ask(f"每{c}容量（{r.unit}）：")
         exp = ask("效期（YYYY-MM-DD）：")
         ids = self.inv.stock_in(r.reagent_id, n, q, exp, self.user)
         nos = [i.split("-")[1].lstrip("0") for i in ids]
-        print(f"\n  ✔ 已入庫 {len(ids)} 瓶「{r['name']}」，自動編號 #{nos[0]}～#{nos[-1]}，"
-              f"請在瓶身標上對應號碼。")
+        print(f"\n  ✔ 已入庫 {len(ids)} {c}「{r['name']}」，自動編號 #{nos[0]}～#{nos[-1]}，"
+              f"請在每{c}上標上對應號碼。")
         print(f"  ✔ 可用總量：{self.inv.total_stock(r.reagent_id):g} {r.unit}")
 
     # 4 新增
     def add(self):
         name = ask("試劑名稱：")
         unit = ask("單位（mL、g、支、管…）：")
+        container = ask("包裝單位（瓶／管／盒／包／罐…，直接 Enter＝瓶）：") or "瓶"
         safety = ask("安全庫存量（低於此數量就提醒）：")
         loc = ask("存放位置（例如 -20°C 冰箱 A 層）：")
         cat = ask("類別（可空白）：")
         vendor = ask("廠商（可空白）：")
-        rid = self.inv.add_reagent(name, unit, safety, loc, cat, vendor, self.user)
+        rid = self.inv.add_reagent(name, unit, safety, loc, cat, vendor, self.user, container)
         print(f"  ✔ 已新增 {rid}「{name}」。")
         if ask("要現在入庫嗎？(y/n)：").lower() == "y":
-            n = ask("這次分裝幾瓶：")
-            q = ask(f"每瓶容量（{unit}）：")
+            n = ask(f"這次分裝幾{container}：")
+            q = ask(f"每{container}容量（{unit}）：")
             exp = ask("效期（YYYY-MM-DD）：")
             ids = self.inv.stock_in(rid, n, q, exp, self.user)
-            print(f"  ✔ 已入庫 {len(ids)} 瓶，編號 #1～#{len(ids)}。")
+            print(f"  ✔ 已入庫 {len(ids)} {container}，編號 #1～#{len(ids)}。")
 
     # 5 刪除
     def remove(self):
@@ -205,25 +213,58 @@ class App:
         else:
             print("  已取消。")
 
+    # 9 撤銷領用
+    def undo(self):
+        recent = self.inv.recent_uses(10)
+        print("\n  【最近的領用紀錄】（最新在上；已撤銷的不顯示）")
+        r = recent.assign(no=["#" + str(int(n)) if str(n) != "nan" else "" for n in recent.bottle_no])
+        print(table(r, {"log_id": "紀錄編號", "time": "時間", "user": "操作者", "name": "試劑名稱",
+                        "no": "序號", "qty": "用量", "unit": "單位"}))
+        if recent.empty:
+            return
+        log_id = ask("輸入要撤銷的紀錄編號（例如 L00012，Enter 取消）：").upper()
+        if not log_id:
+            print("  已取消。")
+            return
+        if ask(f"確定撤銷 {log_id}？用量會加回原本的包裝 (y/n)：").lower() != "y":
+            print("  已取消。")
+            return
+        res = self.inv.undo_use(log_id, self.user)
+        print(f"  ✔ 已撤銷 {res.log_id}：{res.name} #{res.bottle_no} 加回 {res.qty:g} {res.unit}，"
+              f"現在剩 {res.bottle_remaining:g} {res.unit}；可用總量 {res.total_after:g} {res.unit}")
+
+    # 10 編輯品項
+    def edit(self):
+        r = self.pick_reagent()
+        if r is None:
+            return
+        print("  每一項直接 Enter＝不修改。")
+        changes = {}
+        for key, label in [("name", "名稱"), ("safety_stock", "安全庫存量"), ("location", "存放位置"),
+                           ("container", "包裝單位"), ("unit", "單位"), ("category", "類別"), ("vendor", "廠商")]:
+            cur = f"{r[key]:g}" if key == "safety_stock" else r[key]
+            changes[key] = ask(f"{label}［目前：{cur or '（空白）'}］：")
+        diff = self.inv.edit_reagent(r.reagent_id, self.user, **changes)
+        for k, (a, b) in diff.items():
+            print(f"  ✔ {k_label(k)}：{_fmt(a)} → {_fmt(b)}")
+
     # 6 提醒清單
     def alerts(self, interactive: bool = True):
         low, exp = self.inv.low_stock(), self.inv.expiring()
         print(f"\n  【低於安全庫存】{len(low)} 項")
         print(table(low, {"reagent_id": "編號", "name": "試劑名稱", "total": "可用量", "unit": "單位",
                           "safety_stock": "安全量", "location": "存放位置", "flag": "狀態"}))
-        print(f"\n  【{EXPIRY_WARNING_DAYS} 天內到期或已過期】{len(exp)} 瓶")
+        print(f"\n  【{EXPIRY_WARNING_DAYS} 天內到期或已過期】{len(exp)} 件")
         e = exp.assign(no=["#" + str(n) for n in exp.bottle_no],
                        note=["已過期" if d < 0 else "" for d in exp.days_left]) if len(exp) else exp
-        print(table(e, {"name": "試劑名稱", "no": "瓶號", "remaining_qty": "剩量", "unit": "單位",
+        print(table(e, {"name": "試劑名稱", "no": "序號", "remaining_qty": "剩量", "unit": "單位",
                         "expiry_date": "效期", "days_left": "剩餘天數", "note": "備註"}))
         if interactive and (len(low) or len(exp)) and ask("\n要寄出提醒信嗎？(y/n)：").lower() == "y":
             self.send_alerts(low, exp)
 
-    def send_alerts(self, low, exp):
-        if len(low):
-            print("  低庫存提醒：" + self._describe(self.notifier.send(*low_stock_message(low, self.inv.today))))
-        if len(exp):
-            print("  到期提醒：" + self._describe(self.notifier.send(*expiry_message(exp, self.inv.today))))
+    def send_alerts(self, low=None, exp=None):
+        for label, result in send_alerts(self.inv, self.notifier):
+            print(f"  {label}：" + self._describe(result))
 
     # 7 統計
     def report_stats(self):
@@ -238,7 +279,7 @@ class App:
     # 8 匯出
     def export(self):
         p1 = export_report(self.inv, OUTPUT_DIR / f"庫存報表_{self.inv.today:%Y%m%d}.csv")
-        p2 = export_bottles(self.inv, OUTPUT_DIR / f"逐瓶明細_{self.inv.today:%Y%m%d}.csv")
+        p2 = export_bottles(self.inv, OUTPUT_DIR / f"包裝明細_{self.inv.today:%Y%m%d}.csv")
         print(f"  ✔ 已匯出：{rel(p1)}\n  ✔ 已匯出：{rel(p2)}\n  （可直接用 Excel 開啟）")
 
     @staticmethod
@@ -254,23 +295,22 @@ class App:
         low, exp = self.inv.low_stock(), self.inv.expiring()
         if not (len(low) or len(exp)):
             return
-        print(f"  ⚠ 提醒：{len(low)} 項低於安全庫存、{len(exp)} 瓶 {EXPIRY_WARNING_DAYS} 天內到期或已過期（選單 6 查看）")
-        today = self.inv.today.isoformat()
-        if state_file.exists() and state_file.read_text().strip() == today:
-            return
-        print("  今日第一次開啟，自動寄出每日提醒：")
-        self.send_alerts(low, exp)
-        state_file.write_text(today)
-
+        print(f"  ⚠ 提醒：{len(low)} 項低於安全庫存、{len(exp)} 件 {EXPIRY_WARNING_DAYS} 天內到期或已過期（選單 6 查看）")
+        results = daily_reminder(self.inv, self.notifier, state_file)
+        if results:
+            print("  今日第一次開啟，自動寄出每日提醒：")
+            for label, result in results:
+                print(f"  {label}：" + self._describe(result))
 
 MENU = """
 {line}
  LabStock 實驗室試劑庫存管理    操作者：{user}    日期：{today}
 {line}
- 1. 查詢／搜尋試劑            5. 刪除試劑品項
- 2. 領用試劑（扣量）          6. 低庫存與到期清單／寄提醒
- 3. 入庫（新貨分裝）          7. 庫存統計與圖表
- 4. 新增試劑品項              8. 匯出庫存報表（CSV）
+ 1. 查詢／搜尋試劑            6. 低庫存與到期清單／寄提醒
+ 2. 領用試劑（扣量）          7. 庫存統計與圖表
+ 3. 入庫（新貨分裝）          8. 匯出庫存報表（CSV）
+ 4. 新增試劑品項              9. 撤銷領用紀錄
+ 5. 刪除試劑品項             10. 編輯試劑品項
  0. 離開
 {line}"""
 
@@ -294,13 +334,16 @@ def main(argv: list[str] | None = None) -> None:
     inv = Inventory(Storage(data_dir), today)
     notifier = Notifier(load_email_settings(), data_dir / "outbox")
 
+    for stream in (sys.stdout, sys.stderr):  # Windows 主控台遇到無法顯示的符號時以 ? 取代，不會當掉
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     print(f"LabStock v{__version__}")
     user = ask("請輸入你的名字（記錄操作者用）：") or "未填"
     app = App(inv, notifier, user)
     app.daily_check(data_dir / "notify_state.txt")
 
     actions = {"1": app.query, "2": app.use, "3": app.stock_in, "4": app.add, "5": app.remove,
-               "6": app.alerts, "7": app.report_stats, "8": app.export}
+               "6": app.alerts, "7": app.report_stats, "8": app.export, "9": app.undo, "10": app.edit}
     while True:
         print(MENU.format(line=LINE, user=user, today=today))
         try:
@@ -312,7 +355,7 @@ def main(argv: list[str] | None = None) -> None:
             break
         fn = actions.get(choice)
         if fn is None:
-            print("  請輸入 0～8。")
+            print("  請輸入 0～10。")
             continue
         try:
             fn()

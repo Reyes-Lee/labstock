@@ -163,3 +163,72 @@ def test_TC19_匯出中文欄位CSV(tmp_path, inv, taq):
     df = pd.read_csv(p, encoding="utf-8-sig")
     assert list(df.columns[:3]) == ["編號", "試劑名稱", "類別"]
     assert p.read_bytes().startswith(b"\xef\xbb\xbf")   # 有 BOM，Excel 開啟不亂碼
+
+
+# ---------- 新增功能：編輯品項、撤銷領用、包裝單位 ----------
+def test_TC20_編輯品項並留下紀錄(inv, taq):
+    diff = inv.edit_reagent(taq, user="測試", safety_stock=150, location="-80°C 冰箱", vendor="")
+    assert diff == {"safety_stock": (100.0, 150.0), "location": ("-20°C 冰箱", "-80°C 冰箱")}
+    r = inv.get_reagent(taq)
+    assert (r.safety_stock, r.location) == (150, "-80°C 冰箱")
+    assert inv.history(taq, 1).iloc[0].note == "安全庫存量 100→150；存放位置 -20°C 冰箱→-80°C 冰箱"
+    assert list(inv.low_stock().reagent_id) == []          # 150 ≥ 150，剛好不算低庫存
+    inv.edit_reagent(taq, safety_stock=200)
+    assert list(inv.low_stock().reagent_id) == [taq]      # 改安全量後立即反映
+
+
+def test_TC21_編輯不合理會被拒絕(inv, taq):
+    inv.add_reagent("10X PBS", "mL", 200)
+    with pytest.raises(InventoryError, match="已經有"):
+        inv.edit_reagent(taq, name="10x pbs")
+    with pytest.raises(InventoryError, match="還有庫存"):
+        inv.edit_reagent(taq, unit="mL")
+    with pytest.raises(InventoryError, match="沒有任何修改"):
+        inv.edit_reagent(taq, location="-20°C 冰箱")
+    with pytest.raises(InventoryError, match="不可小於 0"):
+        inv.edit_reagent(taq, safety_stock=-1)
+
+
+def test_TC22_撤銷領用恢復剩量與用完狀態(inv, taq):
+    inv.use_up(taq, "R001-001", user="小林")             # #1 用完
+    log_id = inv.recent_uses(1).iloc[0].log_id
+    res = inv.undo_use(log_id, user="小林")
+    assert (res.bottle_no, res.qty, res.bottle_remaining, res.total_after) == (1, 50, 50, 150)
+    b = inv.bottles_of(taq)
+    assert b.loc[b.bottle_id == "R001-001", "status"].item() == "在庫"
+    assert inv.recent_uses().empty                       # 已撤銷的不再列出
+
+
+def test_TC23_不能重複撤銷或撤銷非領用紀錄(inv, taq):
+    inv.use(taq, 10)
+    log_id = inv.recent_uses(1).iloc[0].log_id
+    inv.undo_use(log_id)
+    with pytest.raises(InventoryError, match="已經撤銷過"):
+        inv.undo_use(log_id)
+    with pytest.raises(InventoryError, match="只能撤銷領用"):
+        inv.undo_use("L00001")                            # 第一筆是「新增品項」
+    with pytest.raises(InventoryError, match="找不到"):
+        inv.undo_use("L99999")
+    assert inv.total_stock(taq) == 150
+
+
+def test_TC24_包裝單位與舊資料相容(tmp_path, inv):
+    rid = inv.add_reagent("50 mL 離心管", "支", 50, container="包")
+    assert inv.get_reagent(rid).container == "包"
+    # 模擬舊版資料（沒有包裝單位欄位）→ 讀取時自動補「瓶」
+    p = tmp_path / "data" / "reagents.csv"
+    df = pd.read_csv(p, encoding="utf-8-sig").drop(columns=["container"])
+    df.to_csv(p, index=False, encoding="utf-8-sig")
+    assert inv.get_reagent(rid).container == "瓶"
+
+
+def test_TC25_一百五十種試劑仍可在一秒內完成查詢與領用(inv):
+    import time
+    for i in range(150):
+        rid = inv.add_reagent(f"試劑{i:03d}", "mL", 100)
+        inv.stock_in(rid, 3, 50, "2028-01-01")
+    start = time.perf_counter()
+    search(inv, "試劑149")
+    inv.use("R150", 10)
+    inv.low_stock()
+    assert time.perf_counter() - start < 1.0

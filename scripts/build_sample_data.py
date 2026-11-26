@@ -21,17 +21,17 @@ OUT = ROOT / "data" / "sample"
 TODAY = date(2026, 11, 27)
 
 REAGENTS = [
-    # 名稱, 單位, 安全量, 位置, 類別, 廠商
-    ("Taq DNA Polymerase", "μL", 100, "-20°C 冰箱 A 層", "酵素", "廠商甲"),
-    ("10X PBS 緩衝液", "mL", 200, "室溫試劑櫃", "緩衝液", "廠商乙"),
-    ("50 mL 離心管", "支", 50, "耗材櫃 2", "耗材", "廠商丙"),
-    ("1.5 mL 微量離心管", "支", 200, "耗材櫃 1", "耗材", "廠商丙"),
-    ("Agarose 洋菜膠", "g", 20, "室溫試劑櫃", "粉末試劑", "廠商甲"),
-    ("DMEM 培養基", "mL", 500, "4°C 冰箱", "培養基", "廠商丁"),
-    ("胎牛血清 FBS", "mL", 50, "-20°C 冰箱 B 層", "血清", "廠商丁"),
-    ("Trypsin-EDTA", "mL", 20, "-20°C 冰箱 B 層", "酵素", "廠商丁"),
-    ("95% 乙醇", "mL", 1000, "防爆櫃", "溶劑", "廠商乙"),
-    ("SDS 十二烷基硫酸鈉", "g", 10, "室溫試劑櫃", "粉末試劑", "廠商乙"),
+    # 名稱, 單位, 安全量, 位置, 類別, 廠商, 包裝單位
+    ("Taq DNA Polymerase", "μL", 100, "-20°C 冰箱 A 層", "酵素", "廠商甲", "管"),
+    ("10X PBS 緩衝液", "mL", 200, "室溫試劑櫃", "緩衝液", "廠商乙", "瓶"),
+    ("50 mL 離心管", "支", 50, "耗材櫃 2", "耗材", "廠商丙", "包"),
+    ("1.5 mL 微量離心管", "支", 200, "耗材櫃 1", "耗材", "廠商丙", "包"),
+    ("Agarose 洋菜膠", "g", 20, "室溫試劑櫃", "粉末試劑", "廠商甲", "罐"),
+    ("DMEM 培養基", "mL", 500, "4°C 冰箱", "培養基", "廠商丁", "瓶"),
+    ("胎牛血清 FBS", "mL", 50, "-20°C 冰箱 B 層", "血清", "廠商丁", "管"),
+    ("Trypsin-EDTA", "mL", 20, "-20°C 冰箱 B 層", "酵素", "廠商丁", "瓶"),
+    ("95% 乙醇", "mL", 1000, "防爆櫃", "溶劑", "廠商乙", "瓶"),
+    ("SDS 十二烷基硫酸鈉", "g", 10, "室溫試劑櫃", "粉末試劑", "廠商乙", "罐"),
 ]
 
 # 試劑編號, 瓶數, 每瓶容量, 效期, 入庫日
@@ -70,8 +70,8 @@ def main() -> None:
     if OUT.exists():
         shutil.rmtree(OUT)
     inv = Inventory(Storage(OUT), today=TODAY)
-    for name, unit, safety, loc, cat, vendor in REAGENTS:
-        inv.add_reagent(name, unit, safety, loc, cat, vendor, user="示範管理者")
+    for name, unit, safety, loc, cat, vendor, container in REAGENTS:
+        inv.add_reagent(name, unit, safety, loc, cat, vendor, user="示範管理者", container=container)
     for rid, n, q, exp, rec in STOCK_IN:
         inv.stock_in(rid, n, q, exp, user="示範管理者", received_date=rec)
     for rid, total, user in USAGE:

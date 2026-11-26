@@ -64,3 +64,27 @@ class Notifier:
         p.write_text(f"主旨：{subject}\n收件人：{', '.join(self.settings.recipients) or '（未設定）'}\n\n{body}\n",
                      encoding="utf-8")
         return p
+
+
+def send_alerts(inv, notifier: Notifier) -> list[tuple[str, str]]:
+    """寄出目前的低庫存與到期提醒；回傳 [(提醒種類, 寄送結果)]。介面層（文字選單、網頁）共用。"""
+    results = []
+    low, exp = inv.low_stock(), inv.expiring()
+    if len(low):
+        results.append(("低庫存提醒", notifier.send(*low_stock_message(low, inv.today))))
+    if len(exp):
+        results.append(("到期提醒", notifier.send(*expiry_message(exp, inv.today))))
+    return results
+
+
+def daily_reminder(inv, notifier: Notifier, state_file: Path) -> list[tuple[str, str]] | None:
+    """每天第一次開啟時寄一封每日摘要；今天已寄過或沒有需要提醒的項目則回傳 None。"""
+    if not (len(inv.low_stock()) or len(inv.expiring())):
+        return None
+    today = inv.today.isoformat()
+    state_file = Path(state_file)
+    if state_file.exists() and state_file.read_text().strip() == today:
+        return None
+    results = send_alerts(inv, notifier)
+    state_file.write_text(today)
+    return results

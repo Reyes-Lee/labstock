@@ -1,0 +1,14 @@
+# 機密設定
+config.ini
+# 實際實驗室資料與示範執行產生的檔案
+data/lab/
+data/demo/
+output/
+**/outbox/
+**/backup/
+notify_state.txt
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
